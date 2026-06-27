@@ -37,6 +37,80 @@ Platform team owns:        XRD + Composition
 
 ---
 
+## 2b. What we actually installed — every component explained
+
+This is the concrete inventory of what ran in the cluster, top to bottom.
+
+### Crossplane core (Helm, namespace `crossplane-system`) — **v2.3.3**
+Two pods:
+- **`crossplane`** — the core controller. Runs the package manager (installs Providers/Functions) and the reconcilers for XRs/Compositions.
+- **`crossplane-rbac-manager`** — auto-grants each Provider the RBAC it needs to manage its CRDs, so you don't hand-write ClusterRoles per provider.
+
+Installing core alone gives you ~25 CRDs (Provider, ProviderConfig, Composition, XRD, Function…) but **no AWS knowledge yet** — that comes from providers.
+
+### Providers — the plugins that teach Crossplane about AWS
+A **Provider** = a package that (a) installs CRDs for one AWS service and (b) runs a controller pod that calls the AWS API. We installed:
+
+| Provider | Version | What it gave us |
+|---|---|---|
+| **`provider-aws-s3`** | v1.21.0 | CRDs in group `s3.aws.upbound.io` — `Bucket`, `BucketPolicy`, `BucketVersioning`, … |
+| **`provider-aws-rds`** | v1.21.0 | CRDs in group `rds.aws.upbound.io` — `Instance`, `SubnetGroup`, … |
+| **`provider-family-aws`** | v2.6.1 | Pulled in *automatically* as a dependency. Ships the shared **`ProviderConfig`** CRDs and the AWS auth machinery. |
+
+Why a "family" provider? Upbound split the giant monolithic AWS provider into small per-service providers (s3, rds, ec2…) that all share one **family** provider for auth/config. You install only the services you need → far fewer CRDs and a lighter cluster. Each service provider runs its **own controller pod** under its **own ServiceAccount**.
+
+> Counting CRDs before/after a provider install is the quickest way to *see* this: core ≈ 25 CRDs; after `provider-aws-s3` it jumps by the whole `s3.aws.upbound.io` group.
+
+### ProviderConfig — *which account, how to auth* (`providerconfig.yaml`)
+```yaml
+apiVersion: aws.upbound.io/v1beta1
+kind: ProviderConfig
+metadata:
+  name: default            # cluster-scoped; referenced by name from every MR
+spec:
+  credentials:
+    source: IRSA           # "don't use a Secret — use the injected web-identity token"
+```
+One `ProviderConfig` named `default`, shared by **both** providers (it lives in the shared family group). `source: IRSA` is the line that says "authenticate via the pod's IAM-role token, no static keys." Think of it as Terraform's `provider "aws" {}` block — but the credentials come from IRSA at runtime.
+
+### DeploymentRuntimeConfig — pins the SA + IRSA annotation (`runtimeconfig*.yaml`)
+A provider normally generates a **random** ServiceAccount name, which makes IRSA impossible (the IAM trust policy must name an exact SA). The `DeploymentRuntimeConfig` fixes that:
+```yaml
+apiVersion: pkg.crossplane.io/v1beta1
+kind: DeploymentRuntimeConfig
+metadata:
+  name: aws-irsa-config
+spec:
+  serviceAccountTemplate:
+    metadata:
+      name: provider-aws-s3                                   # fixed, predictable SA name
+      annotations:
+        eks.amazonaws.com/role-arn: arn:aws:iam::<acct>:role/crossplane-provider-aws-s3
+```
+The provider references it via `runtimeConfigRef`. We made **one per provider** (`aws-irsa-config` for s3, `aws-irsa-rds-config` for rds) because each provider's pod runs under a different SA and assumes a different IAM role. *(This is the modern replacement for the old, deprecated `ControllerConfig`.)*
+
+### Managed Resources (MRs) — the actual cloud things (`MR/`)
+- **`MR/bucket.yaml`** — an `S3Bucket`. `providerConfigRef.name: default` → authed via IRSA. Name is globally-unique (`...-300545976125-aps1`) because S3 names are global.
+- **`MR/rds.yaml`** — an RDS `Instance` (`db.t3.micro`, MySQL 8.0.46). Reads its admin password from the `rds-master-password` Secret (`passwordSecretRef`) and **publishes a connection Secret** (`quorumify-db-conn`) via `writeConnectionSecretToRef`.
+
+### Two Secrets in play
+- **`rds-master-password`** — *input* you create; the admin password Crossplane feeds to RDS.
+- **`quorumify-db-conn`** — *output* Crossplane creates after the DB is ready, merging your `username`/`password` with AWS's `host`/`port`/`endpoint`. A developer mounts this one Secret and gets a working DSN.
+
+### How it all chains together
+```
+DeploymentRuntimeConfig ──► Provider pod's ServiceAccount  (fixed name + role-arn annotation)
+            │                         │
+            │            EKS pod-identity webhook injects AWS_ROLE_ARN + token file
+            ▼                         ▼
+       ProviderConfig (source: IRSA) ──► provider calls AssumeRoleWithWebIdentity
+            ▲                         │
+   MR (Bucket / RDS Instance) ────────┘  → short-lived creds → resource created in AWS
+   (providerConfigRef: default)
+```
+
+---
+
 ## 3. IRSA — the deepest interview topic of the day
 
 **Problem it solves:** a pod needs to call AWS without baking long-lived access keys into a Secret (leak-forever, manual rotation, shared blast radius).
